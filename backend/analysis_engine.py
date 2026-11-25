@@ -1,0 +1,1630 @@
+from __future__ import annotations
+
+import math
+import os
+import subprocess
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import imageio_ffmpeg
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import mediapipe as mp
+import numpy as np
+import pandas as pd
+from matplotlib import font_manager
+
+APP_VERSION = "11.2"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_CACHE_DIR = Path(os.environ.get("BFA_MODEL_CACHE_DIR", "/tmp/bfa_models" if os.environ.get("VERCEL") else str(BASE_DIR)))
+MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = BASE_DIR / "batting_analysis_output"
+CONVERTED_DIR = OUTPUT_DIR / "converted_videos"
+IMPACT_DIR = OUTPUT_DIR / "impact_frames"
+GRAPH_DIR = OUTPUT_DIR / "graphs"
+MAX_INPUT_WIDTH = 1280
+
+POSE_MODEL = {
+    "filename": "pose_landmarker_heavy.task",
+    "url": (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"
+    ),
+}
+HAND_MODEL = {
+    "filename": "hand_landmarker.task",
+    "url": (
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+        "hand_landmarker/float16/1/hand_landmarker.task"
+    ),
+}
+
+FEATURES = {
+    "身体を開くな": {
+        "display_name": "身体の開き",
+        "direction_positive": "大きい",
+        "direction_negative": "小さい",
+        "key": "shoulder_opening",
+        "unit": "degree",
+        "description": "構えからインパクトまでの上半身の開き具合",
+        "tolerance": 18.0,
+    },
+    "割れを作れ": {
+        "display_name": "割れ",
+        "direction_positive": "大きい",
+        "direction_negative": "小さい",
+        "key": "hip_shoulder_separation",
+        "unit": "degree",
+        "description": "スイング前にできる肩と腰のひねりの差",
+        "tolerance": 15.0,
+    },
+    "ボールを引きつけろ": {
+        "display_name": "ボールの引きつけ",
+        "direction_positive": "遠い",
+        "direction_negative": "近い",
+        "key": "hand_torso_distance",
+        "unit": "shoulder-width ratio",
+        "description": "インパクト時に手を身体の近くまで引きつけられているか",
+        "tolerance": 0.30,
+    },
+    "軸をぶらすな": {
+        "display_name": "軸のブレ",
+        "direction_positive": "多い",
+        "direction_negative": "少ない",
+        "key": "axis_sway",
+        "unit": "shoulder-width ratio",
+        "description": "構えからインパクトまでに身体の軸が横へどれくらい動いたか",
+        "tolerance": 0.35,
+    },
+    "壁を作れ": {
+        "display_name": "前脚の壁",
+        "direction_positive": "伸びている",
+        "direction_negative": "曲がっている",
+        "key": "front_knee_angle",
+        "unit": "degree",
+        "description": "インパクト時に前脚でどの程度受け止められているか",
+        "tolerance": 20.0,
+    },
+    "頭を残せ": {
+        "display_name": "頭の残り",
+        "direction_positive": "多い",
+        "direction_negative": "少ない",
+        "key": "head_movement",
+        "unit": "shoulder-width ratio",
+        "description": "構えからインパクトまでに頭がどれくらい動いたか",
+        "tolerance": 0.30,
+    },
+    "体重移動をしろ": {
+        "display_name": "体重移動",
+        "direction_positive": "多い",
+        "direction_negative": "少ない",
+        "key": "weight_transfer",
+        "unit": "shoulder-width ratio",
+        "description": "構えからインパクトまでに身体を前方へどれくらい移動させたか",
+        "tolerance": 0.35,
+    },
+    "腰を使え": {
+        "display_name": "腰の回転",
+        "direction_positive": "速い",
+        "direction_negative": "遅い",
+        "key": "hip_rotation_speed",
+        "unit": "degree/sec",
+        "description": "インパクト前後で腰がどれくらい速く回転しているか",
+        "tolerance": 180.0,
+    },
+}
+
+NOSE = 0
+LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
+LEFT_ELBOW, RIGHT_ELBOW = 13, 14
+LEFT_WRIST, RIGHT_WRIST = 15, 16
+LEFT_HIP, RIGHT_HIP = 23, 24
+LEFT_KNEE, RIGHT_KNEE = 25, 26
+LEFT_ANKLE, RIGHT_ANKLE = 27, 28
+
+KEY_JOINTS = [
+    LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_WRIST, RIGHT_WRIST,
+    LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE,
+    LEFT_ANKLE, RIGHT_ANKLE,
+]
+
+
+@dataclass
+class VideoAnalysis:
+    path: str
+    fps: float
+    frame_count: int
+    width: int
+    height: int
+    world_landmarks: np.ndarray
+    normalized_landmarks: np.ndarray
+    raw_normalized_landmarks: np.ndarray
+    valid_mask: np.ndarray
+    impact_frame: int
+    stance_frame: int
+    swing_onset_frame: int
+    impact_candidates: List[int]
+    features: Dict[str, float]
+    extra_metrics: Dict[str, float] = field(default_factory=dict)
+    roi_x0: float = 0.0
+    roi_x1: float = 1.0
+    quality_score: float = 0.0
+    quality_label: str = "未評価"
+    quality_details: Dict[str, float] = field(default_factory=dict)
+
+
+def configure_output_directory(base_dir=None):
+    global OUTPUT_DIR, CONVERTED_DIR, IMPACT_DIR, GRAPH_DIR
+    OUTPUT_DIR = Path(base_dir) if base_dir is not None else BASE_DIR / "batting_analysis_output"
+    CONVERTED_DIR = OUTPUT_DIR / "converted_videos"
+    IMPACT_DIR = OUTPUT_DIR / "impact_frames"
+    GRAPH_DIR = OUTPUT_DIR / "graphs"
+    for d in [OUTPUT_DIR, CONVERTED_DIR, IMPACT_DIR, GRAPH_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+    return OUTPUT_DIR
+
+
+configure_output_directory()
+
+
+def setup_japanese_font():
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\meiryob.ttc",
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\YuGothR.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                font_manager.fontManager.addfont(path)
+                name = font_manager.FontProperties(fname=path).get_name()
+                plt.rcParams["font.family"] = name
+                plt.rcParams["axes.unicode_minus"] = False
+                return name
+            except Exception:
+                pass
+    plt.rcParams["axes.unicode_minus"] = False
+    return None
+
+
+JAPANESE_FONT_NAME = setup_japanese_font()
+
+
+def ensure_pose_model() -> Path:
+    path = MODEL_CACHE_DIR / POSE_MODEL["filename"]
+    if not path.exists():
+        urllib.request.urlretrieve(POSE_MODEL["url"], str(path))
+    return path
+
+
+def ensure_hand_model() -> Path:
+    path = MODEL_CACHE_DIR / HAND_MODEL["filename"]
+    if not path.exists():
+        urllib.request.urlretrieve(HAND_MODEL["url"], str(path))
+    return path
+
+
+def can_opencv_read_video(video_path) -> bool:
+    cap = cv2.VideoCapture(str(video_path))
+    ok = cap.isOpened()
+    success, frame = cap.read() if ok else (False, None)
+    cap.release()
+    return bool(ok and success and frame is not None)
+
+
+def convert_video_to_mp4(input_path, output_path):
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-y", "-i", str(input_path),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", str(output_path),
+    ]
+    p = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace"
+    )
+    if p.returncode != 0 or not Path(output_path).exists():
+        raise RuntimeError("動画のMP4変換に失敗しました。")
+    return Path(output_path)
+
+
+def prepare_video_for_analysis(original_path, prefix):
+    original_path = Path(original_path)
+    if original_path.suffix.lower() == ".mp4" and can_opencv_read_video(original_path):
+        return original_path
+    converted = CONVERTED_DIR / f"{prefix}_converted.mp4"
+    convert_video_to_mp4(original_path, converted)
+    if not can_opencv_read_video(converted):
+        raise RuntimeError("MP4変換後も動画を読み込めませんでした。")
+    return converted
+
+
+def midpoint(a, b):
+    return (np.asarray(a) + np.asarray(b)) / 2.0
+
+
+def joint_angle(a, b, c):
+    ba = np.asarray(a[:3], dtype=float) - np.asarray(b[:3], dtype=float)
+    bc = np.asarray(c[:3], dtype=float) - np.asarray(b[:3], dtype=float)
+    den = np.linalg.norm(ba) * np.linalg.norm(bc)
+    if den < 1e-8:
+        return np.nan
+    cosv = np.clip(np.dot(ba, bc) / den, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosv)))
+
+
+def horizontal_line_angle(left_point, right_point):
+    dx = right_point[0] - left_point[0]
+    dz = right_point[2] - left_point[2]
+    return float(np.degrees(np.arctan2(dz, dx)))
+
+
+def image_line_angle(left_point, right_point):
+    dx = right_point[0] - left_point[0]
+    dy = right_point[1] - left_point[1]
+    return float(np.degrees(np.arctan2(dy, dx)))
+
+
+def circular_angle_difference(a, b):
+    return np.abs(np.degrees(np.arctan2(
+        np.sin(np.radians(np.asarray(a) - np.asarray(b))),
+        np.cos(np.radians(np.asarray(a) - np.asarray(b))),
+    )))
+
+
+def signed_angle_difference(a, b):
+    return np.degrees(np.arctan2(
+        np.sin(np.radians(np.asarray(a) - np.asarray(b))),
+        np.cos(np.radians(np.asarray(a) - np.asarray(b))),
+    ))
+
+
+def moving_average(values, window=5):
+    return pd.Series(np.asarray(values, dtype=float)).rolling(
+        window=max(1, int(window)), center=True, min_periods=1
+    ).mean().to_numpy()
+
+
+def _safe_nanmax(values, default=np.nan):
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    return float(np.max(finite)) if finite.size else float(default)
+
+
+def _safe_nanmedian(values, default=np.nan):
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    return float(np.median(finite)) if finite.size else float(default)
+
+
+def _safe_nanpercentile(values, q, default=np.nan):
+    """NaNを除いてパーセンタイルを返す。外れ値1フレームに代表値を支配させないために使う。"""
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    return float(np.percentile(finite, q)) if finite.size else float(default)
+
+
+def _robust_window_median(values, center, radius, valid_mask=None, default=np.nan):
+    arr = np.asarray(values, dtype=float)
+    n = len(arr)
+    if n == 0:
+        return float(default)
+    center = int(np.clip(center, 0, n - 1))
+    lo = max(0, center - int(radius))
+    hi = min(n, center + int(radius) + 1)
+    sec = arr[lo:hi].copy()
+    if valid_mask is not None:
+        mask = np.asarray(valid_mask, dtype=bool)[lo:hi]
+        sec[~mask] = np.nan
+    value = _safe_nanmedian(sec, default=np.nan)
+    if np.isfinite(value):
+        return value
+    fallback = arr[center]
+    return float(fallback) if np.isfinite(fallback) else float(default)
+
+
+def interpolate_landmarks(landmark_array, valid_mask):
+    result = np.asarray(landmark_array, dtype=float).copy()
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    frames = np.arange(len(result))
+    if len(result) == 0:
+        return result
+    for landmark in range(result.shape[1]):
+        for dim in range(3):
+            values = result[:, landmark, dim]
+            good = valid_mask & np.isfinite(values)
+            if good.sum() >= 2:
+                result[:, landmark, dim] = np.interp(frames, frames[good], values[good])
+    return result
+
+
+def _pose_to_arrays(world_pose, normalized_pose):
+    world = np.array([
+        [lm.x, lm.y, lm.z, getattr(lm, "visibility", 1.0)] for lm in world_pose
+    ], dtype=float)
+    norm = np.array([
+        [lm.x, lm.y, lm.z, getattr(lm, "visibility", 1.0)] for lm in normalized_pose
+    ], dtype=float)
+    return world, norm
+
+
+def _angle_2d(a, b, c):
+    ba = np.asarray(a[:2]) - np.asarray(b[:2])
+    bc = np.asarray(c[:2]) - np.asarray(b[:2])
+    den = np.linalg.norm(ba) * np.linalg.norm(bc)
+    if den < 1e-8:
+        return np.nan
+    return float(np.degrees(np.arccos(np.clip(np.dot(ba, bc) / den, -1, 1))))
+
+
+def _batter_pose_score(norm):
+    required = [NOSE, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_WRIST, RIGHT_WRIST,
+                LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE, LEFT_ANKLE, RIGHT_ANKLE]
+    points = norm[required]
+    if not np.all(np.isfinite(points[:, :2])):
+        return -1e9
+    visibility = float(np.nanmean(points[:, 3]))
+    ls, rs = norm[LEFT_SHOULDER], norm[RIGHT_SHOULDER]
+    lw, rw = norm[LEFT_WRIST], norm[RIGHT_WRIST]
+    lh, rh = norm[LEFT_HIP], norm[RIGHT_HIP]
+    sh = midpoint(ls[:2], rs[:2])
+    hip = midpoint(lh[:2], rh[:2])
+    wrist = midpoint(lw[:2], rw[:2])
+    shoulder_width = max(float(np.linalg.norm(ls[:2] - rs[:2])), 1e-4)
+    torso_h = max(float(abs(hip[1] - sh[1])), 1e-4)
+    hand_close = float(np.clip(1.4 - np.linalg.norm(lw[:2] - rw[:2]) / shoulder_width, 0, 1))
+    hand_height = float(np.clip((hip[1] - wrist[1]) / torso_h, -0.2, 1.4))
+    hand_height_score = max(0.0, hand_height / 1.4)
+    left_knee = _angle_2d(norm[LEFT_HIP], norm[LEFT_KNEE], norm[LEFT_ANKLE])
+    right_knee = _angle_2d(norm[RIGHT_HIP], norm[RIGHT_KNEE], norm[RIGHT_ANKLE])
+    knees = [v for v in [left_knee, right_knee] if np.isfinite(v)]
+    knee_extension = float(np.clip((np.mean(knees) - 65) / 95, 0, 1)) if knees else 0
+    ankle = midpoint(norm[LEFT_ANKLE, :2], norm[RIGHT_ANKLE, :2])
+    standing = float(np.clip(abs(ankle[1] - hip[1]) / max(torso_h * 1.5, 1e-4), 0, 1))
+    # 捕手は深い屈曲＋手が低いことが多いため、その両方を弱く減点。
+    crouch_penalty = 0.8 if knee_extension < 0.25 and hand_height_score < 0.20 else 0.0
+    return 2.2 * hand_close + 1.8 * hand_height_score + 1.8 * knee_extension + 0.8 * standing + 0.7 * visibility - crouch_penalty
+
+
+def _select_batter_pose(result, previous_center=None):
+    if not result.pose_world_landmarks or not result.pose_landmarks:
+        return None, None, None
+    candidates = []
+    count = min(len(result.pose_world_landmarks), len(result.pose_landmarks))
+    for i in range(count):
+        world, norm = _pose_to_arrays(result.pose_world_landmarks[i], result.pose_landmarks[i])
+        hip = midpoint(norm[LEFT_HIP, :2], norm[RIGHT_HIP, :2])
+        if not np.all(np.isfinite(hip)):
+            continue
+        score = _batter_pose_score(norm)
+        if previous_center is not None and np.all(np.isfinite(previous_center)):
+            dist = float(np.linalg.norm(hip - previous_center))
+            score += 4.8 * math.exp(-0.5 * (dist / 0.11) ** 2)
+        candidates.append((score, world, norm, hip))
+    if not candidates:
+        return None, None, None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, world, norm, hip = candidates[0]
+    return world, norm, hip
+
+
+def _normalize_batter_roi(roi):
+    if not roi:
+        return 0.0, 1.0
+    center = float(np.clip(roi.get("center", 0.5), 0, 1))
+    width = float(np.clip(roi.get("width", 0.6), 0.20, 1.0))
+    x0 = max(0.0, center - width / 2)
+    x1 = min(1.0, center + width / 2)
+    if x1 - x0 < width:
+        if x0 <= 0:
+            x1 = min(1.0, width)
+        else:
+            x0 = max(0.0, 1.0 - width)
+    return float(x0), float(x1)
+
+
+def _map_crop_to_full(norm, x0, x1):
+    mapped = norm.copy()
+    mapped[:, 0] = x0 + mapped[:, 0] * max(x1 - x0, 1e-6)
+    return mapped
+
+
+def _is_temporally_consistent(current, previous):
+    if previous is None:
+        return True
+    stable = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE, LEFT_ANKLE, RIGHT_ANKLE]
+    if not np.all(np.isfinite(current[stable, :2])):
+        return False
+    if not np.all(np.isfinite(previous[stable, :2])):
+        return True
+    cur_torso = np.mean(current[[LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP], :2], axis=0)
+    prev_torso = np.mean(previous[[LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP], :2], axis=0)
+    if float(np.linalg.norm(cur_torso - prev_torso)) > 0.20:
+        return False
+    return True
+
+
+def _longest_true_run(mask):
+    best = current = 0
+    for v in np.asarray(mask, dtype=bool):
+        if v:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return int(best)
+
+
+def _nearest_valid_frame(frame, valid_mask, max_distance):
+    valid = np.asarray(valid_mask, dtype=bool)
+    if len(valid) == 0:
+        return None
+    frame = int(np.clip(frame, 0, len(valid) - 1))
+    if valid[frame]:
+        return frame
+    for d in range(1, max(0, int(max_distance)) + 1):
+        for idx in (frame - d, frame + d):
+            if 0 <= idx < len(valid) and valid[idx]:
+                return idx
+    return None
+
+
+def _masked_speed(points, fps, valid_mask):
+    points = np.asarray(points, dtype=float)
+    valid = np.asarray(valid_mask, dtype=bool)
+    speed = np.full(len(points), np.nan, dtype=float)
+    if len(points) >= 2:
+        diffs = np.linalg.norm(np.diff(points, axis=0), axis=1) * fps
+        good = valid[:-1] & valid[1:]
+        speed[1:][good] = diffs[good]
+    return speed
+
+
+def _masked_angle_velocity(angles, fps, valid_mask):
+    angles = np.asarray(angles, dtype=float)
+    valid = np.asarray(valid_mask, dtype=bool)
+    unwrapped = np.degrees(np.unwrap(np.radians(angles)))
+    velocity = np.full(len(angles), np.nan, dtype=float)
+    if len(angles) >= 2:
+        diff = np.diff(unwrapped) * fps
+        good = valid[:-1] & valid[1:]
+        velocity[1:][good] = diff[good]
+    return velocity
+
+
+def _robust_scale(values):
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 3:
+        return np.zeros_like(arr)
+    lo, hi = np.percentile(finite, [20, 95])
+    den = max(float(hi - lo), 1e-9)
+    out = (arr - lo) / den
+    return np.clip(out, 0.0, 1.0)
+
+
+def _motion_signals(world, norm, valid_mask, fps):
+    left_wrist = world[:, LEFT_WRIST, :3]
+    right_wrist = world[:, RIGHT_WRIST, :3]
+    wrist_center = midpoint(left_wrist, right_wrist)
+    wrist_speed = 0.35 * _masked_speed(left_wrist, fps, valid_mask) + 0.35 * _masked_speed(right_wrist, fps, valid_mask) + 0.30 * _masked_speed(wrist_center, fps, valid_mask)
+
+    sh_angles = np.array([horizontal_line_angle(f[LEFT_SHOULDER], f[RIGHT_SHOULDER]) for f in world])
+    hip_angles = np.array([horizontal_line_angle(f[LEFT_HIP], f[RIGHT_HIP]) for f in world])
+    sh_speed = np.abs(_masked_angle_velocity(sh_angles, fps, valid_mask))
+    hip_speed = np.abs(_masked_angle_velocity(hip_angles, fps, valid_mask))
+
+    # 画像上の身体中心速度も加え、World原点依存のない移動情報を利用。
+    torso2d = midpoint(
+        midpoint(norm[:, LEFT_SHOULDER, :2], norm[:, RIGHT_SHOULDER, :2]),
+        midpoint(norm[:, LEFT_HIP, :2], norm[:, RIGHT_HIP, :2]),
+    )
+    torso_speed2d = _masked_speed(torso2d, fps, valid_mask)
+
+    win = max(3, int(round(fps * 0.06)))
+    if win % 2 == 0:
+        win += 1
+    signals = {
+        "wrist_speed": moving_average(wrist_speed, win),
+        "shoulder_speed": moving_average(sh_speed, win),
+        "hip_speed": moving_average(hip_speed, win),
+        "torso_speed2d": moving_average(torso_speed2d, win),
+        "shoulder_angles": sh_angles,
+        "hip_angles": hip_angles,
+    }
+    return signals
+
+
+def estimate_impact_candidates(world, norm, fps, valid_mask, top_k=3):
+    """手首速度だけでなく、肩・骨盤回転と身体移動を合わせた候補推定。"""
+    signals = _motion_signals(world, norm, valid_mask, fps)
+    n = len(world)
+    if n <= 2:
+        return [0], 0
+
+    wrist_n = _robust_scale(signals["wrist_speed"])
+    shoulder_n = _robust_scale(signals["shoulder_speed"])
+    hip_n = _robust_scale(signals["hip_speed"])
+    torso_n = _robust_scale(signals["torso_speed2d"])
+
+    combined = 0.50 * wrist_n + 0.22 * shoulder_n + 0.20 * hip_n + 0.08 * torso_n
+    valid = np.asarray(valid_mask, dtype=bool)
+    combined[~valid] = np.nan
+
+    search_start = max(1, int(round(0.05 * n)))
+    search_end = min(n - 2, int(round(0.95 * n)))
+    finite = combined[search_start:search_end + 1]
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        idx = int(np.flatnonzero(valid)[0]) if valid.any() else 0
+        return [idx], idx
+
+    # スイング開始: 序盤基準より明確に上がった最初の連続区間。
+    baseline_end = max(search_start + 2, int(round(n * 0.35)))
+    baseline = _safe_nanmedian(combined[search_start:baseline_end], 0.0)
+    threshold = max(float(baseline) + 0.18, float(np.nanmax(finite)) * 0.25)
+    onset = search_start
+    run = 0
+    needed = max(2, int(round(fps * 0.04)))
+    for i in range(search_start, search_end + 1):
+        if np.isfinite(combined[i]) and combined[i] >= threshold:
+            run += 1
+            if run >= needed:
+                onset = max(search_start, i - run + 1)
+                break
+        else:
+            run = 0
+
+    # 手首速度が高く、肩・腰回転も立ち上がっている局所ピークを候補にする。
+    peaks = []
+    peak_floor = max(0.42, float(np.nanmax(finite)) * 0.62)
+    candidate_start = max(
+        onset + max(2, int(round(0.10 * fps))),
+        search_start + 1,
+    )
+    for i in range(candidate_start, search_end):
+        if not np.isfinite(combined[i]):
+            continue
+        if combined[i] < peak_floor:
+            continue
+        if combined[i] >= combined[i - 1] and combined[i] >= combined[i + 1]:
+            # 後半フォロースルーを少しだけ不利にする。
+            progress = (i - onset) / max(1, search_end - onset)
+            score = float(combined[i] - 0.10 * max(progress - 0.45, 0.0))
+            peaks.append((score, i))
+
+    if not peaks:
+        best = int(np.nanargmax(combined[search_start:search_end + 1])) + search_start
+        peaks = [(float(combined[best]), best)]
+
+    peaks.sort(key=lambda x: x[0], reverse=True)
+    candidates = []
+    min_gap = max(2, int(round(fps * 0.06)))
+    for _, idx in peaks:
+        if all(abs(idx - j) >= min_gap for j in candidates):
+            snapped = _nearest_valid_frame(idx, valid, max(2, int(round(0.08 * fps))))
+            if snapped is not None:
+                candidates.append(int(snapped))
+        if len(candidates) >= top_k:
+            break
+
+    if not candidates:
+        candidates = [int(_nearest_valid_frame(onset, valid, max(2, int(round(0.1 * fps)))) or onset)]
+
+    # 表示は時系列順でなく、最有力→次点の順。自動採用は最有力。
+    return candidates, int(onset)
+
+
+def estimate_stance_frame(world, norm, valid_mask, impact_frame, onset_frame, fps):
+    """固定0.8秒前ではなく、スイング開始前の低動作フレームから構えを選ぶ。"""
+    valid = np.asarray(valid_mask, dtype=bool)
+    signals = _motion_signals(world, norm, valid, fps)
+    wrist = signals["wrist_speed"]
+    hip = signals["hip_speed"]
+    sh = signals["shoulder_speed"]
+    motion = _robust_scale(wrist) + 0.4 * _robust_scale(hip) + 0.4 * _robust_scale(sh)
+
+    start = max(0, int(impact_frame - round(1.20 * fps)))
+    end = min(max(start + 1, onset_frame), int(impact_frame - round(0.12 * fps)))
+    if end <= start:
+        fallback = impact_frame - int(round(0.8 * fps))
+        return int(_nearest_valid_frame(fallback, valid, max(3, int(round(0.15 * fps)))) or max(0, fallback))
+
+    indices = [i for i in range(start, end + 1) if valid[i] and np.isfinite(motion[i])]
+    if not indices:
+        fallback = impact_frame - int(round(0.8 * fps))
+        return int(_nearest_valid_frame(fallback, valid, max(3, int(round(0.15 * fps)))) or max(0, fallback))
+    # 低動作かつなるべくスイング開始に近いフレームを優先。
+    scores = [(float(motion[i]) + 0.12 * (end - i) / max(1, end - start), i) for i in indices]
+    scores.sort(key=lambda x: x[0])
+    return int(scores[0][1])
+
+
+def _analysis_quality(valid_mask, raw_norm, impact_frame, fps):
+    valid = np.asarray(valid_mask, dtype=bool)
+    n = len(valid)
+    if n == 0:
+        return {"score": 0.0, "label": "解析不可", "overall_detection_rate": 0.0,
+                "impact_window_detection_rate": 0.0, "impact_window_longest_run": 0,
+                "impact_window_transition_rate": 0.0, "key_joint_visibility": 0.0}
+    pre = max(0, impact_frame - int(round(0.70 * fps)))
+    post = min(n, impact_frame + int(round(0.30 * fps)) + 1)
+    wm = valid[pre:post]
+    overall = float(valid.mean())
+    impact_rate = float(wm.mean()) if len(wm) else 0.0
+    longest = _longest_true_run(wm)
+    transition = float((wm[:-1] & wm[1:]).mean()) if len(wm) >= 2 else 0.0
+    vis = 0.0
+    try:
+        sec = np.asarray(raw_norm)[pre:post][:, KEY_JOINTS, 3]
+        finite = sec[np.isfinite(sec)]
+        if finite.size:
+            vis = float(np.clip(np.nanmean(finite), 0, 1))
+    except Exception:
+        pass
+    score = 100 * (
+        0.10 * min(overall / 0.75, 1.0)
+        + 0.35 * min(impact_rate / 0.85, 1.0)
+        + 0.20 * min(longest / max(1.0, 0.25 * fps), 1.0)
+        + 0.15 * min(transition / 0.75, 1.0)
+        + 0.20 * np.clip((vis - 0.35) / 0.50, 0, 1)
+    )
+    label = "高" if score >= 80 else "要注意" if score >= 60 else "解析不可"
+    return {
+        "score": round(float(score), 1), "label": label,
+        "overall_detection_rate": overall,
+        "impact_window_detection_rate": impact_rate,
+        "impact_window_longest_run": int(longest),
+        "impact_window_transition_rate": transition,
+        "key_joint_visibility": vis,
+        "impact_window_start": pre,
+        "impact_window_end": max(pre, post - 1),
+    }
+
+
+def _assert_analysis_quality(q, fps):
+    problems = []
+    if q["impact_window_detection_rate"] < 0.55:
+        problems.append("インパクト前後の骨格検出率が55%未満")
+    if q["impact_window_longest_run"] < max(3, int(round(0.12 * fps))):
+        problems.append("インパクト前後の連続検出区間が短い")
+    if q["impact_window_transition_rate"] < 0.45:
+        problems.append("実測フレーム間の連続性が不足")
+    if q["key_joint_visibility"] < 0.45:
+        problems.append("主要関節visibilityが低い")
+    if q["score"] < 60:
+        problems.append("解析信頼度が60点未満")
+    if problems:
+        raise ValueError(
+            "この動画は解析品質が不足しているため、数値化を停止しました。\n"
+            f"解析信頼度: {q['score']:.1f}/100（{q['label']}）\n"
+            + " / ".join(problems)
+            + "\n打者が大きく映る2〜5秒程度の動画にし、必要なら解析範囲を調整してください。"
+        )
+
+
+def _shoulder_width_2d(norm, frame):
+    return max(float(np.linalg.norm(norm[frame, LEFT_SHOULDER, :2] - norm[frame, RIGHT_SHOULDER, :2])), 1e-5)
+
+
+def _body_center_proxy(xy):
+    """画像座標の複数部位から作る2D身体中心proxy。真の身体重心ではない。"""
+    shoulder = midpoint(xy[:, LEFT_SHOULDER, :2], xy[:, RIGHT_SHOULDER, :2])
+    hip = midpoint(xy[:, LEFT_HIP, :2], xy[:, RIGHT_HIP, :2])
+    knees = midpoint(xy[:, LEFT_KNEE, :2], xy[:, RIGHT_KNEE, :2])
+    # 体幹を重めにした単純proxy。生体力学的な真のCOMとは呼ばない。
+    return 0.30 * shoulder + 0.50 * hip + 0.20 * knees
+
+
+def calculate_features(world, norm, fps, impact_frame, stance_frame, onset_frame, batter_side, valid_mask, image_aspect_ratio=1.0):
+    """ver.10.0 hotfix: 1フレームの外れ値で代表値が暴れないよう、時間窓とrobust統計を使う。"""
+    valid = np.asarray(valid_mask, dtype=bool)
+    n = len(world)
+    fps = max(float(fps), 1e-6)
+    radius = max(1, int(round(0.05 * fps)))
+
+    # normalized x/y は単位が異なるため、xを幅/高さ比で補正してから2D距離・角度を計算する。
+    xy = np.asarray(norm[:, :, :2], dtype=float).copy()
+    xy[:, :, 0] *= max(float(image_aspect_ratio), 1e-6)
+
+    # 主要関節のvisibilityが低い実測フレームは、特徴量の代表値計算から除外する。
+    core_joints = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]
+    try:
+        core_visibility = np.nanmean(np.asarray(norm[:, core_joints, 3], dtype=float), axis=1)
+        core_valid = valid & np.isfinite(core_visibility) & (core_visibility >= 0.50)
+    except Exception:
+        core_valid = valid.copy()
+    if core_valid.sum() < max(4, int(round(0.12 * fps))):
+        core_valid = valid.copy()
+
+    # 肩幅は1フレーム固定ではなく、構え周辺の中央値を使う。
+    world_shoulder_width = np.linalg.norm(
+        world[:, LEFT_SHOULDER, :3] - world[:, RIGHT_SHOULDER, :3], axis=1
+    ).astype(float)
+    shoulder_width_world = _robust_window_median(
+        world_shoulder_width, stance_frame, radius, core_valid, default=1e-6
+    )
+    shoulder_width_world = max(float(shoulder_width_world), 1e-6)
+
+    shoulder_width_2d_series = np.linalg.norm(
+        xy[:, LEFT_SHOULDER, :2] - xy[:, RIGHT_SHOULDER, :2], axis=1
+    ).astype(float)
+    shoulder_width_2d = _robust_window_median(
+        shoulder_width_2d_series, stance_frame, radius, core_valid, default=1e-5
+    )
+    shoulder_width_2d = max(float(shoulder_width_2d), 1e-5)
+
+    lead_hip, lead_knee, lead_ankle = (
+        (LEFT_HIP, LEFT_KNEE, LEFT_ANKLE) if batter_side == "右打者"
+        else (RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE)
+    )
+
+    sh_angles = np.array([horizontal_line_angle(f[LEFT_SHOULDER], f[RIGHT_SHOULDER]) for f in world], dtype=float)
+    hip_angles = np.array([horizontal_line_angle(f[LEFT_HIP], f[RIGHT_HIP]) for f in world], dtype=float)
+    sh_unwrap = np.degrees(np.unwrap(np.radians(sh_angles)))
+    hip_unwrap = np.degrees(np.unwrap(np.radians(hip_angles)))
+
+    # 3D推定の瞬間的なz方向ノイズを抑える。
+    smooth_window = max(3, int(round(0.08 * fps)))
+    if smooth_window % 2 == 0:
+        smooth_window += 1
+    sh_for_smooth = sh_unwrap.copy()
+    hip_for_smooth = hip_unwrap.copy()
+    sh_for_smooth[~core_valid] = np.nan
+    hip_for_smooth[~core_valid] = np.nan
+    sh_smooth = pd.Series(sh_for_smooth).rolling(smooth_window, center=True, min_periods=1).median().to_numpy()
+    hip_smooth = pd.Series(hip_for_smooth).rolling(smooth_window, center=True, min_periods=1).median().to_numpy()
+
+    # 1. 身体を開くな: 構え/インパクトの単一フレームではなく各±0.05秒の中央値。
+    stance_sh = _robust_window_median(sh_smooth, stance_frame, radius, core_valid, default=sh_unwrap[stance_frame])
+    impact_sh = _robust_window_median(sh_smooth, impact_frame, radius, core_valid, default=sh_unwrap[impact_frame])
+    shoulder_opening = float(circular_angle_difference(float(impact_sh), float(stance_sh)))
+
+    # 2. 割れ: 「最大1フレーム」を廃止し、インパクト前の上位傾向(90パーセンタイル)を代表値にする。
+    pre_start = max(stance_frame, impact_frame - int(round(0.7 * fps)))
+    separation = circular_angle_difference(sh_smooth, hip_smooth).astype(float)
+    sep_sec = separation[pre_start:impact_frame + 1].copy()
+    sep_mask = core_valid[pre_start:impact_frame + 1]
+    sep_sec[~sep_mask] = np.nan
+    finite_sep = sep_sec[np.isfinite(sep_sec)]
+    if finite_sep.size >= 5:
+        hip_shoulder_separation = _safe_nanpercentile(finite_sep, 90)
+    else:
+        hip_shoulder_separation = _safe_nanmedian(finite_sep)
+
+    shoulder_centers_world = midpoint(world[:, LEFT_SHOULDER, :3], world[:, RIGHT_SHOULDER, :3])
+    hip_centers_world = midpoint(world[:, LEFT_HIP, :3], world[:, RIGHT_HIP, :3])
+    hand_centers_world = midpoint(world[:, LEFT_WRIST, :3], world[:, RIGHT_WRIST, :3])
+    torso_world = midpoint(shoulder_centers_world, hip_centers_world)
+
+    # 3. 手-体幹距離もインパクト周辺中央値。
+    hand_ratio = np.linalg.norm(hand_centers_world - torso_world, axis=1) / np.maximum(world_shoulder_width, 1e-6)
+    hand_valid = valid.copy()
+    try:
+        wrist_vis = np.nanmean(norm[:, [LEFT_WRIST, RIGHT_WRIST], 3], axis=1)
+        hand_valid &= np.isfinite(wrist_vis) & (wrist_vis >= 0.45)
+    except Exception:
+        pass
+    hand_torso_distance = _robust_window_median(
+        hand_ratio, impact_frame, radius, hand_valid, default=hand_ratio[impact_frame]
+    )
+
+    shoulder_centers_2d = midpoint(xy[:, LEFT_SHOULDER, :2], xy[:, RIGHT_SHOULDER, :2])
+    hip_centers_2d = midpoint(xy[:, LEFT_HIP, :2], xy[:, RIGHT_HIP, :2])
+    torso_2d = midpoint(shoulder_centers_2d, hip_centers_2d)
+
+    # 4. 軸移動: max-minではなく5〜95パーセンタイル幅で単発ノイズを除外。
+    torso_x = torso_2d[stance_frame:impact_frame + 1, 0].astype(float)
+    torso_mask = core_valid[stance_frame:impact_frame + 1]
+    torso_x[~torso_mask] = np.nan
+    finite_torso = torso_x[np.isfinite(torso_x)]
+    axis_sway = (
+        (_safe_nanpercentile(finite_torso, 95) - _safe_nanpercentile(finite_torso, 5)) / shoulder_width_2d
+        if finite_torso.size else np.nan
+    )
+
+    # 5. 前脚膝角度: インパクト±0.05秒の中央値。
+    knee_angles = np.full(n, np.nan, dtype=float)
+    knee_valid = valid.copy()
+    for i in range(n):
+        if not valid[i]:
+            continue
+        knee_angles[i] = joint_angle(world[i, lead_hip], world[i, lead_knee], world[i, lead_ankle])
+    front_knee_angle = _robust_window_median(
+        knee_angles, impact_frame, radius, knee_valid, default=knee_angles[impact_frame]
+    )
+
+    # 6. 頭部移動: 構え頭位置も周辺中央値、最大値ではなく95パーセンタイル。
+    head2d = xy[:, NOSE, :2]
+    s0, s1 = max(0, stance_frame-radius), min(n, stance_frame+radius+1)
+    stance_head_pool = head2d[s0:s1][valid[s0:s1]]
+    stance_head = np.nanmedian(stance_head_pool, axis=0) if len(stance_head_pool) else head2d[stance_frame]
+    head_sec = head2d[stance_frame:impact_frame + 1]
+    head_dist = np.linalg.norm(head_sec - stance_head, axis=1).astype(float)
+    head_dist[~valid[stance_frame:impact_frame + 1]] = np.nan
+    head_movement = _safe_nanpercentile(head_dist, 95) / shoulder_width_2d
+
+    # 7. 体重移動: 画像上の骨盤中心を構え/インパクト各窓の中央値で比較。
+    sx0, sx1 = max(0, stance_frame-radius), min(n, stance_frame+radius+1)
+    ix0, ix1 = max(0, impact_frame-radius), min(n, impact_frame+radius+1)
+    stance_hip_x = _safe_nanmedian(hip_centers_2d[sx0:sx1, 0][core_valid[sx0:sx1]], hip_centers_2d[stance_frame, 0])
+    impact_hip_x = _safe_nanmedian(hip_centers_2d[ix0:ix1, 0][core_valid[ix0:ix1]], hip_centers_2d[impact_frame, 0])
+    weight_transfer_signed = float((impact_hip_x - stance_hip_x) / shoulder_width_2d)
+    weight_transfer = abs(weight_transfer_signed)
+
+    # 8. 腰回転速度: 単一最大値ではなく平滑化後の90パーセンタイル。
+    hip_velocity = _masked_angle_velocity(hip_smooth, fps, core_valid)
+    shoulder_velocity = _masked_angle_velocity(sh_smooth, fps, core_valid)
+    hip_speed_smoothed = moving_average(np.abs(hip_velocity), max(3, int(round(0.06 * fps))))
+    shoulder_speed_smoothed = moving_average(np.abs(shoulder_velocity), max(3, int(round(0.06 * fps))))
+    vel_start = max(stance_frame, impact_frame - int(round(0.5 * fps)))
+    vel_end = min(n, impact_frame + int(round(0.15 * fps)) + 1)
+    hip_rotation_speed = _safe_nanpercentile(hip_speed_smoothed[vel_start:vel_end], 90)
+    shoulder_rotation_speed = _safe_nanpercentile(shoulder_speed_smoothed[vel_start:vel_end], 90)
+
+    # ---- 新しい補助指標 ----
+    body_center = _body_center_proxy(xy)
+    stance_body_pool = body_center[sx0:sx1][core_valid[sx0:sx1]]
+    impact_body_pool = body_center[ix0:ix1][core_valid[ix0:ix1]]
+    stance_body = np.nanmedian(stance_body_pool, axis=0) if len(stance_body_pool) else body_center[stance_frame]
+    impact_body = np.nanmedian(impact_body_pool, axis=0) if len(impact_body_pool) else body_center[impact_frame]
+    body_shift = float(np.linalg.norm(impact_body - stance_body) / shoulder_width_2d)
+    body_speed = _masked_speed(body_center, fps, core_valid) / shoulder_width_2d
+    body_speed = moving_average(body_speed, max(3, int(round(0.06 * fps))))
+    body_speed_peak = _safe_nanpercentile(body_speed[max(stance_frame, onset_frame):impact_frame + 1], 90)
+
+    torso_vec = shoulder_centers_2d - hip_centers_2d
+    torso_side_angles = np.degrees(np.arctan2(torso_vec[:, 0], -torso_vec[:, 1]))
+    torso_side_bend_impact = _robust_window_median(torso_side_angles, impact_frame, radius, core_valid, torso_side_angles[impact_frame])
+    torso_side_bend_stance = _robust_window_median(torso_side_angles, stance_frame, radius, core_valid, torso_side_angles[stance_frame])
+    torso_side_bend_change = abs(float(torso_side_bend_impact - torso_side_bend_stance))
+
+    pelvis_tilt_angles = np.degrees(np.arctan2(
+        xy[:, RIGHT_HIP, 1] - xy[:, LEFT_HIP, 1],
+        xy[:, RIGHT_HIP, 0] - xy[:, LEFT_HIP, 0],
+    ))
+    pelvis_tilt_impact = _robust_window_median(pelvis_tilt_angles, impact_frame, radius, core_valid, pelvis_tilt_angles[impact_frame])
+    pelvis_tilt_stance = _robust_window_median(pelvis_tilt_angles, stance_frame, radius, core_valid, pelvis_tilt_angles[stance_frame])
+    pelvis_tilt_change = abs(float(pelvis_tilt_impact - pelvis_tilt_stance))
+
+    # 運動連鎖ピークも平滑化後の速度を使う。
+    chain_start = max(0, impact_frame - int(round(0.60 * fps)))
+    chain_end = min(n, impact_frame + int(round(0.10 * fps)) + 1)
+    hip_abs = hip_speed_smoothed[chain_start:chain_end]
+    sh_abs = shoulder_speed_smoothed[chain_start:chain_end]
+    hip_peak_frame = chain_start + int(np.nanargmax(hip_abs)) if np.isfinite(hip_abs).any() else impact_frame
+    shoulder_peak_frame = chain_start + int(np.nanargmax(sh_abs)) if np.isfinite(sh_abs).any() else impact_frame
+    sequence_delay_ms = float((shoulder_peak_frame - hip_peak_frame) / fps * 1000.0)
+
+    swing_time_sec = max(0.0, float((impact_frame - onset_frame) / fps))
+
+    return {
+        "shoulder_opening": float(shoulder_opening),
+        "hip_shoulder_separation": float(hip_shoulder_separation),
+        "hand_torso_distance": float(hand_torso_distance),
+        "axis_sway": float(axis_sway),
+        "front_knee_angle": float(front_knee_angle),
+        "head_movement": float(head_movement),
+        "weight_transfer": float(weight_transfer),
+        "hip_rotation_speed": float(hip_rotation_speed),
+    }, {
+        "weight_transfer_signed": weight_transfer_signed,
+        "body_center_shift_proxy": body_shift,
+        "body_center_speed_proxy": body_speed_peak,
+        "torso_side_bend_impact_deg": torso_side_bend_impact,
+        "torso_side_bend_change_deg": torso_side_bend_change,
+        "pelvis_tilt_impact_deg": pelvis_tilt_impact,
+        "pelvis_tilt_change_deg": pelvis_tilt_change,
+        "shoulder_rotation_speed_deg_s": shoulder_rotation_speed,
+        "hip_rotation_speed_deg_s": hip_rotation_speed,
+        "hip_peak_frame": float(hip_peak_frame),
+        "shoulder_peak_frame": float(shoulder_peak_frame),
+        "hip_to_shoulder_peak_delay_ms": sequence_delay_ms,
+        "swing_time_sec": swing_time_sec,
+    }
+
+def _draw_pose_on_frame(frame, norm):
+    h, w = frame.shape[:2]
+    pairs = [
+        (LEFT_SHOULDER, RIGHT_SHOULDER), (LEFT_HIP, RIGHT_HIP),
+        (LEFT_SHOULDER, LEFT_ELBOW), (LEFT_ELBOW, LEFT_WRIST),
+        (RIGHT_SHOULDER, RIGHT_ELBOW), (RIGHT_ELBOW, RIGHT_WRIST),
+        (LEFT_SHOULDER, LEFT_HIP), (RIGHT_SHOULDER, RIGHT_HIP),
+        (LEFT_HIP, LEFT_KNEE), (LEFT_KNEE, LEFT_ANKLE),
+        (RIGHT_HIP, RIGHT_KNEE), (RIGHT_KNEE, RIGHT_ANKLE),
+    ]
+    pts = {}
+    for idx in set(sum(([a, b] for a, b in pairs), [])) | {NOSE}:
+        if idx < len(norm) and np.all(np.isfinite(norm[idx, :2])):
+            pts[idx] = (int(norm[idx, 0] * w), int(norm[idx, 1] * h))
+    for a, b in pairs:
+        if a in pts and b in pts:
+            cv2.line(frame, pts[a], pts[b], (0, 255, 80), 3, cv2.LINE_AA)
+    for p in pts.values():
+        cv2.circle(frame, p, 4, (0, 60, 255), -1, cv2.LINE_AA)
+    return frame
+
+
+def save_pose_frame_image(video_path, frame_number, norm, output_path, label):
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_number))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return
+    frame = _draw_pose_on_frame(frame, norm)
+    cv2.putText(frame, label, (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.imwrite(str(output_path), frame)
+
+
+def get_pose_preview_frame(analysis, frame_number):
+    frame_number = int(np.clip(int(frame_number), 0, max(0, analysis.frame_count - 1)))
+    cap = cv2.VideoCapture(str(analysis.path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return None
+    norm = analysis.normalized_landmarks[frame_number]
+    if np.isfinite(norm[:, :3]).any():
+        frame = _draw_pose_on_frame(frame, norm)
+    cv2.putText(frame, f"FRAME {frame_number}  {frame_number / analysis.fps:.3f}s", (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def get_video_preview_frame(video_path, frame_ratio=0.35):
+    cap = cv2.VideoCapture(str(video_path))
+    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if count <= 0:
+        cap.release()
+        return None
+    idx = int(np.clip(round((count - 1) * float(frame_ratio)), 0, count - 1))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return None
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def draw_roi_preview(image_rgb, center, width):
+    if image_rgb is None:
+        return None
+    image = image_rgb.copy()
+    h, w = image.shape[:2]
+    x0, x1 = _normalize_batter_roi({"center": center, "width": width})
+    px0, px1 = int(x0 * w), int(x1 * w)
+    if px0 > 0:
+        image[:, :px0] = (image[:, :px0] * 0.35).astype(np.uint8)
+    if px1 < w:
+        image[:, px1:] = (image[:, px1:] * 0.35).astype(np.uint8)
+    cv2.rectangle(image, (px0, 2), (max(px0 + 1, px1 - 1), h - 3), (255, 55, 55), 5)
+    return image
+
+
+def suggest_batter_roi(video_path, frame_ratio=0.35):
+    """1枚のプレビューから打者候補を推定し、横ROIを返す。失敗時は中央60%。"""
+    frame_rgb = get_video_preview_frame(video_path, frame_ratio)
+    if frame_rgb is None:
+        return {"center": 0.5, "width": 0.60, "confidence": 0.0}
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    h, w = frame_bgr.shape[:2]
+    if w > MAX_INPUT_WIDTH:
+        scale = MAX_INPUT_WIDTH / w
+        frame_bgr = cv2.resize(frame_bgr, (MAX_INPUT_WIDTH, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    BaseOptions = mp.tasks.BaseOptions
+    PoseLandmarker = mp.tasks.vision.PoseLandmarker
+    Options = mp.tasks.vision.PoseLandmarkerOptions
+    RunningMode = mp.tasks.vision.RunningMode
+    options = Options(
+        base_options=BaseOptions(model_asset_path=str(ensure_pose_model())),
+        running_mode=RunningMode.IMAGE,
+        num_poses=4,
+        min_pose_detection_confidence=0.30,
+        min_pose_presence_confidence=0.30,
+        output_segmentation_masks=False,
+    )
+    try:
+        with PoseLandmarker.create_from_options(options) as landmarker:
+            result = landmarker.detect(mp_image)
+        world, norm, _ = _select_batter_pose(result)
+        if world is None or norm is None:
+            raise ValueError("no pose")
+        visible = norm[(norm[:, 3] >= 0.35) & np.isfinite(norm[:, 0])]
+        if len(visible) < 6:
+            visible = norm[np.isfinite(norm[:, 0])]
+        x_min, x_max = float(np.min(visible[:, 0])), float(np.max(visible[:, 0]))
+        center = float(np.clip((x_min + x_max) / 2, 0.1, 0.9))
+        width = float(np.clip((x_max - x_min) * 1.55, 0.34, 0.72))
+        return {"center": center, "width": width, "confidence": 1.0}
+    except Exception:
+        return {"center": 0.5, "width": 0.60, "confidence": 0.0}
+
+
+
+
+def _angle_between_2d(v1, v2):
+    v1 = np.asarray(v1, dtype=float)
+    v2 = np.asarray(v2, dtype=float)
+    den = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if den < 1e-8:
+        return np.nan
+    return float(np.degrees(np.arccos(np.clip(np.dot(v1, v2) / den, -1.0, 1.0))))
+
+
+def _hand_wrist_alignment_metrics(video_path, frame_number, pose_norm, roi_x0, roi_x1):
+    """
+    Hand Landmarkerをインパクト付近の1フレームだけに使う。
+    前腕（肘→手首）と手掌（手首→中指MCP）の2D方向差をproxyとして返す。
+    真の橈屈/尺屈角度ではないため、補助指標としてのみ使用する。
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_number))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return {}
+    h, w = frame.shape[:2]
+    px0 = int(np.clip(round(roi_x0 * w), 0, max(0, w - 2)))
+    px1 = int(np.clip(round(roi_x1 * w), px0 + 2, w))
+    crop = frame[:, px0:px1]
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    BaseOptions = mp.tasks.BaseOptions
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    Options = mp.tasks.vision.HandLandmarkerOptions
+    RunningMode = mp.tasks.vision.RunningMode
+    options = Options(
+        base_options=BaseOptions(model_asset_path=str(ensure_hand_model())),
+        running_mode=RunningMode.IMAGE,
+        num_hands=2,
+        min_hand_detection_confidence=0.30,
+        min_hand_presence_confidence=0.30,
+    )
+    with HandLandmarker.create_from_options(options) as landmarker:
+        result = landmarker.detect(image)
+    if not result.hand_landmarks:
+        return {}
+
+    crop_width = max(float(roi_x1 - roi_x0), 1e-6)
+    hands = []
+    for hand in result.hand_landmarks:
+        arr = np.array([[lm.x, lm.y, lm.z] for lm in hand], dtype=float)
+        arr[:, 0] = roi_x0 + arr[:, 0] * crop_width
+        hands.append(arr)
+
+    metrics = {}
+    used = set()
+    for side_name, wrist_idx, elbow_idx in [
+        ("left", LEFT_WRIST, LEFT_ELBOW),
+        ("right", RIGHT_WRIST, RIGHT_ELBOW),
+    ]:
+        aspect = w / max(h, 1)
+        pose_wrist = pose_norm[wrist_idx, :2].copy()
+        pose_elbow = pose_norm[elbow_idx, :2].copy()
+        pose_wrist[0] *= aspect
+        pose_elbow[0] *= aspect
+        best_i, best_dist = None, float("inf")
+        for i, hand in enumerate(hands):
+            if i in used:
+                continue
+            hand_wrist_for_match = hand[0, :2].copy()
+            hand_wrist_for_match[0] *= aspect
+            dist = float(np.linalg.norm(hand_wrist_for_match - pose_wrist))
+            if dist < best_dist:
+                best_i, best_dist = i, dist
+        if best_i is None or best_dist > 0.18:
+            continue
+        used.add(best_i)
+        hand = hands[best_i]
+        forearm = pose_wrist - pose_elbow
+        palm_start = hand[0, :2].copy()
+        palm_end = hand[9, :2].copy()
+        palm_start[0] *= aspect
+        palm_end[0] *= aspect
+        palm = palm_end - palm_start  # wrist -> middle MCP
+        angle = _angle_between_2d(forearm, palm)
+        if np.isfinite(angle):
+            metrics[f"{side_name}_wrist_alignment_proxy_deg"] = float(angle)
+            metrics[f"{side_name}_hand_match_distance"] = best_dist
+    return metrics
+
+
+def analyze_video(video_path, batter_side, prefix, batter_roi=None):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"動画を開けませんでした: {video_path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    BaseOptions = mp.tasks.BaseOptions
+    PoseLandmarker = mp.tasks.vision.PoseLandmarker
+    Options = mp.tasks.vision.PoseLandmarkerOptions
+    RunningMode = mp.tasks.vision.RunningMode
+    options = Options(
+        base_options=BaseOptions(model_asset_path=str(ensure_pose_model())),
+        running_mode=RunningMode.VIDEO,
+        num_poses=2 if batter_roi else 4,
+        min_pose_detection_confidence=0.35,
+        min_pose_presence_confidence=0.35,
+        min_tracking_confidence=0.40,
+        output_segmentation_masks=False,
+    )
+
+    x0, x1 = _normalize_batter_roi(batter_roi)
+    world_list, norm_list, valid_list = [], [], []
+    previous_center = None
+    previous_norm = None
+    reject_run = 0
+    frame_no = 0
+
+    with PoseLandmarker.create_from_options(options) as landmarker:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            h, w = frame.shape[:2]
+            px0 = int(np.clip(round(x0 * w), 0, max(0, w - 2)))
+            px1 = int(np.clip(round(x1 * w), px0 + 2, w))
+            crop = frame[:, px0:px1]
+            if crop.shape[1] > MAX_INPUT_WIDTH:
+                scale = MAX_INPUT_WIDTH / crop.shape[1]
+                crop = cv2.resize(crop, (MAX_INPUT_WIDTH, max(1, int(round(crop.shape[0] * scale)))), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp = int(round(frame_no * 1000.0 / fps))
+            result = landmarker.detect_for_video(image, timestamp)
+            world, norm_crop, center = _select_batter_pose(result, previous_center)
+            raw_found = world is not None and norm_crop is not None
+            temporal_ok = raw_found and _is_temporally_consistent(norm_crop, previous_norm)
+            pose_ok = bool(temporal_ok)
+            if raw_found and not temporal_ok:
+                reject_run += 1
+                if reject_run >= 2 and _batter_pose_score(norm_crop) >= 2.0:
+                    pose_ok = True
+            elif raw_found:
+                reject_run = 0
+            else:
+                reject_run += 1
+                if reject_run >= 3:
+                    previous_center = None
+                    previous_norm = None
+
+            if pose_ok:
+                mapped = _map_crop_to_full(norm_crop, x0, x1)
+                world_list.append(world)
+                norm_list.append(mapped)
+                valid_list.append(True)
+                previous_center = center
+                previous_norm = norm_crop.copy()
+                reject_run = 0
+            else:
+                world_list.append(np.full((33, 4), np.nan))
+                norm_list.append(np.full((33, 4), np.nan))
+                valid_list.append(False)
+            frame_no += 1
+    cap.release()
+
+    if frame_no < 5:
+        raise ValueError("動画のフレーム数が少なすぎます。")
+    valid = np.asarray(valid_list, dtype=bool)
+    valid_count = int(valid.sum())
+    longest = _longest_true_run(valid)
+    if valid_count < max(10, int(round(fps * 0.60))) or longest < max(5, int(round(fps * 0.18))):
+        raise ValueError(
+            "打撃解析に必要な骨格フレームを十分に確保できませんでした。\n"
+            f"骨格検出率: {valid.mean():.1%}\n"
+            "打者が大きく映るよう解析範囲を少し狭めるか、2〜5秒程度の動画にしてください。"
+        )
+
+    raw_norm = np.asarray(norm_list, dtype=float)
+    world = interpolate_landmarks(np.asarray(world_list), valid)
+    norm = interpolate_landmarks(raw_norm, valid)
+
+    candidates, onset = estimate_impact_candidates(world, norm, fps, valid, top_k=3)
+    impact = int(candidates[0])
+    stance = estimate_stance_frame(world, norm, valid, impact, onset, fps)
+    q = _analysis_quality(valid, raw_norm, impact, fps)
+    _assert_analysis_quality(q, fps)
+    features, extra = calculate_features(
+        world, norm, fps, impact, stance, onset, batter_side, valid,
+        image_aspect_ratio=(width / max(height, 1)),
+    )
+    # 手関節はPoseだけでは詳細が不足するため、インパクト1フレームだけHand Landmarkerを追加利用。
+    try:
+        extra.update(_hand_wrist_alignment_metrics(video_path, impact, norm[impact], x0, x1))
+    except Exception:
+        # 手が隠れる・モデル取得不可などでは全体解析を止めない。
+        pass
+
+    analysis = VideoAnalysis(
+        path=str(video_path), fps=fps, frame_count=frame_no, width=width, height=height,
+        world_landmarks=world, normalized_landmarks=norm, raw_normalized_landmarks=raw_norm,
+        valid_mask=valid, impact_frame=impact, stance_frame=stance, swing_onset_frame=onset,
+        impact_candidates=[int(v) for v in candidates], features=features, extra_metrics=extra,
+        roi_x0=x0, roi_x1=x1, quality_score=float(q["score"]), quality_label=str(q["label"]), quality_details=q,
+    )
+    save_pose_frame_image(video_path, stance, norm[stance], IMPACT_DIR / f"{prefix}_stance_pose.jpg", "STANCE")
+    save_pose_frame_image(video_path, impact, norm[impact], IMPACT_DIR / f"{prefix}_impact_pose.jpg", "IMPACT")
+    return analysis
+
+
+def similarity_score(reference_value, target_value, tolerance):
+    """内部互換用の0〜100指標。画面上の主評価には使用しない。"""
+    if not np.isfinite(reference_value) or not np.isfinite(target_value):
+        return np.nan
+    diff = abs(float(target_value) - float(reference_value))
+    z = diff / max(float(tolerance), 1e-9)
+    score = 100.0 / (1.0 + (z / 1.25) ** 2.0)
+    return float(np.clip(score, 0.0, 100.0))
+
+
+def comparison_level(normalized_difference):
+    """比較選手との差を4段階で返す。優劣ではなく『近さ』の表示。"""
+    if not np.isfinite(normalized_difference):
+        return "評価保留"
+    z = abs(float(normalized_difference))
+    if z <= 0.50:
+        return "かなり近い"
+    if z <= 1.00:
+        return "やや近い"
+    if z <= 1.75:
+        return "差がある"
+    return "大きく異なる"
+
+
+def overall_comparison_label(score_dataframe):
+    vals = pd.to_numeric(score_dataframe.get("差の尺度"), errors="coerce")
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return "評価保留"
+    return comparison_level(float(np.nanmean(np.abs(vals))))
+
+
+def _feature_value_text(value, unit):
+    if not np.isfinite(value):
+        return "測定困難"
+    v = float(value)
+    if unit == "degree":
+        return f"{v:.1f}°"
+    if unit == "degree/sec":
+        return f"{v:.0f}°/s"
+    if unit == "shoulder-width ratio":
+        return f"肩幅の{v:.2f}倍"
+    return f"{v:.3f}"
+
+
+def build_score_table(reference_analysis, target_analysis, selected_names):
+    rows = []
+    for name in selected_names:
+        cfg = FEATURES[name]
+        ref = float(reference_analysis.features[cfg["key"]])
+        tar = float(target_analysis.features[cfg["key"]])
+        signed = tar - ref
+        tolerance = max(float(cfg["tolerance"]), 1e-9)
+        z_signed = signed / tolerance
+        score = similarity_score(ref, tar, tolerance)
+        if not np.isfinite(signed):
+            direction = "評価保留"
+        elif abs(signed) < tolerance * 0.05:
+            direction = "ほぼ同じ"
+        elif signed > 0:
+            direction = f"比較選手より{cfg['direction_positive']}"
+        else:
+            direction = f"比較選手より{cfg['direction_negative']}"
+        rows.append({
+            "評価項目": name,  # 保存互換用
+            "表示名": cfg["display_name"],
+            "計測内容": cfg["description"],
+            "比較選手": round(ref, 3),
+            "自分": round(tar, 3),
+            "比較選手表示": _feature_value_text(ref, cfg["unit"]),
+            "自分表示": _feature_value_text(tar, cfg["unit"]),
+            "単位": cfg["unit"],
+            "差": round(signed, 3),
+            "差の絶対値": round(abs(signed), 3),
+            "差の尺度": round(z_signed, 3),
+            "差の方向": direction,
+            "比較判定": comparison_level(z_signed),
+            "得点": round(float(score), 1),  # 旧履歴互換用。UIには出さない
+        })
+    return pd.DataFrame(rows)
+
+
+def save_difference_direction_chart(df):
+    """比較選手との差の方向だけを示す。異なる単位を許容差で標準化する。"""
+    labels = df["表示名"].tolist()
+    values = df["差の尺度"].astype(float).to_numpy()
+    values = np.clip(values, -3.0, 3.0)
+    fig_h = max(4.2, 0.78 * len(labels) + 1.8)
+    fig, ax = plt.subplots(figsize=(9.5, fig_h))
+    y = np.arange(len(labels))
+    bars = ax.barh(y, values)
+    ax.axvline(0, linewidth=1.4)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=11)
+    ax.invert_yaxis()
+    ax.set_xlim(-3.1, 3.1)
+    ax.set_xticks([-3, -2, -1, 0, 1, 2, 3])
+    ax.set_xticklabels(["大きく小さい", "小さい", "やや小さい", "比較選手", "やや大きい", "大きい", "大きく大きい"], fontsize=9)
+    ax.set_title("比較選手との差の方向", fontsize=15)
+    ax.set_xlabel("各項目の比較尺度（0に近いほど比較選手に近い）", fontsize=10)
+    ax.grid(axis="x", alpha=0.25)
+    for bar, (_, row) in zip(bars, df.iterrows()):
+        x = float(bar.get_width())
+        text = f"{row['差の方向']} / {row['比較判定']}"
+        ha = "left" if x >= 0 else "right"
+        offset = 0.06 if x >= 0 else -0.06
+        ax.text(x + offset, bar.get_y() + bar.get_height()/2, text, va="center", ha=ha, fontsize=8.5)
+    plt.tight_layout()
+    out = GRAPH_DIR / "比較選手との差の方向.png"
+    plt.savefig(out, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+
+
+PRACTICE_VIDEOS = {
+    "身体を開くな": {
+        "title": "Front Shoulder Closed Baseball Hitting Drill",
+        "provider": "Top Level LA Baseball Academy",
+        "url": "https://www.youtube.com/watch?v=VNZvUp-Q_OQ",
+        "note": "前肩が早く開かないようにするティードリル。肩の回旋量を見直す際の参考。",
+    },
+    "割れを作れ": {
+        "title": "Offset Rotation Drill / Flow Hook 'Em Drill / Step Back Pivot Pick Drill",
+        "provider": "Driveline Baseball",
+        "url": "https://www.youtube.com/watch?v=_km9w9vqqC4&t=28s",
+        "note": "0:28からのOffset Rotation Drillを中心に、骨盤と上半身の回転順序を確認。",
+    },
+    "ボールを引きつけろ": {
+        "title": "3 Drills For Better Connection In The Baseball Swing",
+        "provider": "Hitting Done Right - HDR",
+        "url": "https://www.youtube.com/watch?v=j25A3Mwz0VE&t=50s",
+        "note": "手部と体幹のつながり、短く直接的なバット軌道を確認する3ドリル。",
+    },
+    "軸をぶらすな": {
+        "title": "Hitting & Proper Weight Transfer Drill",
+        "provider": "FieldTurf / Todd Whitting",
+        "url": "https://www.youtube.com/watch?v=txrucZmEPPE",
+        "note": "前方移動と回転のつながりを確認する体重移動ドリル。体幹中心の流れを見る際の参考。",
+    },
+    "壁を作れ": {
+        "title": "Offset Rotation / Step Back Pivot Pick Drill",
+        "provider": "Driveline Baseball",
+        "url": "https://www.youtube.com/watch?v=_km9w9vqqC4&t=319s",
+        "note": "5:19からのStep Back Pivot Pick Drill。前脚で受け止めながら回転する感覚の参考。",
+    },
+    "頭を残せ": {
+        "title": "Baseball Hitting Drills to Work on the Correct Head Movement",
+        "provider": "DNA Sports",
+        "url": "https://www.youtube.com/watch?v=KIoJpTey0Hk",
+        "note": "頭を無理に固定せず、コンタクトまでの頭部移動を確認するためのドリル。",
+    },
+    "体重移動をしろ": {
+        "title": "Hitting & Proper Weight Transfer Drill",
+        "provider": "FieldTurf / Todd Whitting",
+        "url": "https://www.youtube.com/watch?v=txrucZmEPPE",
+        "note": "打撃時の体重移動と踏み込みのつながりを確認する実演。",
+    },
+    "腰を使え": {
+        "title": "Offset Rotation Drill / Flow Hook 'Em Drill / Step Back Pivot Pick Drill",
+        "provider": "Driveline Baseball",
+        "url": "https://www.youtube.com/watch?v=_km9w9vqqC4&t=28s",
+        "note": "骨盤回転を単独で速くするのではなく、上半身との連動を確認する回旋ドリル。",
+    },
+}
+
+def _practice_video_for(name):
+    return PRACTICE_VIDEOS.get(name, {})
+
+
+def _advice_source_for(name):
+    mapping = {
+        "身体を開くな": "骨盤・肩の回転タイミングに関する研究を参考。回転の大小だけで良否は決めません。",
+        "割れを作れ": "肩―骨盤の相対回旋・運動連鎖に関する研究を参考。捻転差は大きいほど良いとは限りません。",
+        "ボールを引きつけろ": "スイング半径・上肢のエネルギーフロー研究を参考。ただしバット軌道・力学量は動画から直接測定していません。",
+        "軸をぶらすな": "身体中心位置・速度を扱う研究を参考。表示値は画像上のproxyで真の身体重心ではありません。",
+        "壁を作れ": "インパクト再現性に関わる下肢・骨盤姿勢の研究を参考。膝角度単独で優劣は判定しません。",
+        "頭を残せ": "頭部位置は視認性・姿勢安定の補助指標として扱います。",
+        "体重移動をしろ": "身体重心位置・速度を扱う研究を参考。真の重心や地面反力は測定していません。",
+        "腰を使え": "体幹筋形態・骨盤回旋研究を参考。筋力不足や筋量は動画から推定しません。",
+    }
+    return mapping.get(name, "先行研究は補助的な解釈に使用しています。")
+
+
+def generate_improvement_advice(score_df, ref, tar):
+    """差が大きい上位3観点だけを、観測→解釈→改善→練習→根拠の順で返す。"""
+    ranked = score_df.copy()
+    ranked["__magnitude"] = ranked["差の尺度"].astype(float).abs()
+    ranked = ranked.sort_values("__magnitude", ascending=False)
+    ranked = ranked[ranked["比較判定"].isin(["差がある", "大きく異なる"])]
+    rows = []
+
+    def add(name, row, interpretation, direction, training):
+        cfg = FEATURES[name]
+        diff_text = f"{row['比較選手表示']} → {row['自分表示']}"
+        rows.append({
+            "観点": cfg["display_name"],
+            "比較結果": f"{diff_text}（{row['差の方向']}）",
+            "比較判定": row["比較判定"],
+            "動作の特徴": interpretation,
+            "改善の方向性": direction,
+            "練習例": training,
+            "研究上の位置づけ": _advice_source_for(name),
+            "参考動画タイトル": _practice_video_for(name).get("title", ""),
+            "参考動画提供元": _practice_video_for(name).get("provider", ""),
+            "参考動画URL": _practice_video_for(name).get("url", ""),
+            "参考動画メモ": _practice_video_for(name).get("note", ""),
+            "差の尺度": float(abs(row["差の尺度"])),
+        })
+
+    for _, row in ranked.head(3).iterrows():
+        name = row["評価項目"]
+        rv = float(row["比較選手"]); tv = float(row["自分"])
+        if name == "身体を開くな":
+            if tv > rv:
+                interpretation = "構えからインパクトまでの肩の回旋量が比較選手より大きい傾向です。上半身の回転が早い、または回転量そのものが大きい可能性があります。"
+            else:
+                interpretation = "構えからインパクトまでの肩の回旋量が比較選手より小さい傾向です。上半身の回転が抑えられている可能性があります。"
+            direction = "肩だけを増減させるのではなく、骨盤が動き始めてから肩がどのタイミングで追従するかを確認してください。"
+            training = "50〜70%強度の分解ティー打撃。踏み込み→骨盤→胸郭→腕の順をスロー動画で確認。"
+        elif name == "割れを作れ":
+            interpretation = "インパクト前の肩―骨盤捻転差が比較選手と異なります。これは『捻り不足／捻り過ぎ』を単独で断定する値ではありません。"
+            direction = "捻転差の大きさだけでなく、骨盤と肩が回り始める順序と、捻転が解放されるタイミングを合わせることを優先してください。"
+            training = "ステップ後に一度止まる分解ティー、メディシンボール回旋、ゆっくりした連続素振り。"
+        elif name == "ボールを引きつけろ":
+            interpretation = "インパクト付近の手部―体幹距離が比較選手と異なります。手部軌道や打点の違いが反映されている可能性があります。"
+            direction = "『近いほど良い』とはせず、窮屈さや外回りがないかを動画で確認し、打つコースに応じた手部位置を探してください。"
+            training = "内外角のコース別ティー、短いバットでのコンパクトスイング、同じ打点で3〜5球反復。"
+        elif name == "軸をぶらすな":
+            interpretation = "構えからインパクトまでの体幹中心の横移動幅が比較選手と異なります。身体全体の流れや回転中心の違いが反映されます。"
+            direction = "横移動をゼロにするのではなく、移動がインパクト直前まで続いていないか、股関節周辺で回転へ移れているかを確認してください。"
+            training = "ノーステップティー、踏み込み後静止ドリル、同じカメラ位置で3〜5球比較。"
+        elif name == "壁を作れ":
+            interpretation = "インパクト付近の前脚膝角度が比較選手と異なります。前脚が伸びる／曲がるタイミングの違いが反映されています。"
+            direction = "膝角度だけを合わせるのではなく、踏み込み後に骨盤回転を受け止めるタイミングを確認してください。"
+            training = "踏み込み後静止ドリル、低強度ティー、スプリットスクワット。"
+        elif name == "頭を残せ":
+            interpretation = "構えからインパクトまでの頭部移動量が比較選手と異なります。身体の並進や体幹姿勢の違いが影響している可能性があります。"
+            direction = "頭を無理に固定せず、インパクトまで視線位置と体幹姿勢が大きく崩れていないかを確認してください。"
+            training = "ノーステップティー、頭の横に目印を置いたスロー素振り。"
+        elif name == "体重移動をしろ":
+            interpretation = "画像上の骨盤中心の水平移動量が比較選手と異なります。これは体重そのものの移動量ではなく、身体位置のproxyです。"
+            direction = "移動量の大小より、踏み込みからインパクトまでに前方移動が収束し、回転へつながっているかを確認してください。"
+            training = "歩きティー、ステップ打撃、踏み込み後静止ドリル。"
+        elif name == "腰を使え":
+            interpretation = "インパクト前後の骨盤回転速度が比較選手と異なります。筋力差ではなく、回転の立ち上がりやタイミングの違いとして解釈します。"
+            direction = "骨盤回転を速くすることだけを狙わず、肩回転との順序とスムーズな連動を確認してください。"
+            training = "メディシンボール回旋、ステップ打撃、50〜70%強度の分解素振り。"
+        else:
+            continue
+        add(name, row, interpretation, direction, training)
+
+    if not rows:
+        rows.append({
+            "観点": "全体",
+            "比較結果": "選択した項目では、比較選手との大きな差は検出されませんでした。",
+            "比較判定": "かなり近い／やや近い",
+            "動作の特徴": "単発の1スイングだけでは再現性までは分かりません。",
+            "改善の方向性": "同じ撮影条件で複数回測定し、毎回同じ傾向が出るか確認してください。",
+            "練習例": "同じ条件で3〜5スイング撮影し、履歴で比較。",
+            "研究上の位置づけ": "インパクト再現性研究では複数試技のばらつきを扱っています。",
+            "参考動画タイトル": "",
+            "参考動画提供元": "",
+            "参考動画URL": "",
+            "参考動画メモ": "",
+            "差の尺度": 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _refresh_result(result, selected_feature_names, batter_side):
+    ref = result["reference_analysis"]
+    tar = result["target_analysis"]
+    score_df = build_score_table(ref, tar, selected_feature_names)
+    score_df.to_csv(OUTPUT_DIR / "batting_form_comparison_result.csv", index=False, encoding="utf-8-sig")
+    save_difference_direction_chart(score_df)
+    advice = generate_improvement_advice(score_df, ref, tar)
+    advice.to_csv(OUTPUT_DIR / "打撃フォーム改善提案.csv", index=False, encoding="utf-8-sig")
+    overall = float(score_df["得点"].mean())  # 旧履歴互換用（UIでは非表示）
+    mean_norm = float(np.nanmean(np.abs(score_df["差の尺度"].astype(float))))
+    best = score_df.loc[score_df["差の尺度"].abs().idxmin()]
+    low = score_df.loc[score_df["差の尺度"].abs().idxmax()]
+    result.update({
+        "overall_score": overall,
+        "mean_normalized_difference": mean_norm,
+        "overall_comparison_label": overall_comparison_label(score_df),
+        "score_dataframe": score_df,
+        "advice_dataframe": advice,
+        "best_item": str(best["表示名"]),
+        "best_score": float(best["得点"]),
+        "lowest_item": str(low["表示名"]),
+        "lowest_score": float(low["得点"]),
+        "selected_feature_names": list(selected_feature_names),
+        "batter_side": batter_side,
+    })
+    return result
+
+
+def run_analysis(reference_original_path, target_original_path, batter_side, selected_feature_names,
+                 output_dir=None, reference_batter_roi=None, target_batter_roi=None, **_):
+    if batter_side not in {"右打者", "左打者"}:
+        raise ValueError("打席を選択してください。")
+    selected_feature_names = list(selected_feature_names)
+    if not 1 <= len(selected_feature_names) <= len(FEATURES):
+        raise ValueError("評価項目は1〜8項目で指定してください。")
+    if output_dir is not None:
+        configure_output_directory(output_dir)
+    ref_path = prepare_video_for_analysis(reference_original_path, "reference")
+    tar_path = prepare_video_for_analysis(target_original_path, "target")
+    ref = analyze_video(ref_path, batter_side, "reference", reference_batter_roi)
+    tar = analyze_video(tar_path, batter_side, "target", target_batter_roi)
+    result = {
+        "reference_analysis": ref,
+        "target_analysis": tar,
+        "output_dir": Path(OUTPUT_DIR),
+        "analysis_mode": "高精度 ver.10.0",
+        "reference_batter_roi": reference_batter_roi,
+        "target_batter_roi": target_batter_roi,
+    }
+    return _refresh_result(result, selected_feature_names, batter_side)
+
+
+def is_measured_frame(analysis, frame_number):
+    idx = int(np.clip(int(frame_number), 0, max(0, analysis.frame_count - 1)))
+    return bool(analysis.valid_mask[idx])
+
+
+def _apply_manual_impact(analysis, impact_frame, batter_side, prefix):
+    impact = int(np.clip(int(impact_frame), 0, analysis.frame_count - 1))
+    if not analysis.valid_mask[impact]:
+        nearest = _nearest_valid_frame(impact, analysis.valid_mask, max(3, int(round(0.12 * analysis.fps))))
+        if nearest is None:
+            raise ValueError("選択フレーム付近に実測骨格がありません。")
+        impact = int(nearest)
+    stance = estimate_stance_frame(
+        analysis.world_landmarks, analysis.normalized_landmarks, analysis.valid_mask,
+        impact, analysis.swing_onset_frame, analysis.fps,
+    )
+    q = _analysis_quality(analysis.valid_mask, analysis.raw_normalized_landmarks, impact, analysis.fps)
+    _assert_analysis_quality(q, analysis.fps)
+    features, extra = calculate_features(
+        analysis.world_landmarks, analysis.normalized_landmarks, analysis.fps,
+        impact, stance, analysis.swing_onset_frame, batter_side, analysis.valid_mask,
+        image_aspect_ratio=(analysis.width / max(analysis.height, 1)),
+    )
+    try:
+        extra.update(_hand_wrist_alignment_metrics(
+            analysis.path, impact, analysis.normalized_landmarks[impact], analysis.roi_x0, analysis.roi_x1
+        ))
+    except Exception:
+        pass
+    analysis.impact_frame = impact
+    analysis.stance_frame = stance
+    analysis.features = features
+    analysis.extra_metrics = extra
+    analysis.quality_score = float(q["score"])
+    analysis.quality_label = str(q["label"])
+    analysis.quality_details = q
+    save_pose_frame_image(analysis.path, stance, analysis.normalized_landmarks[stance], IMPACT_DIR / f"{prefix}_stance_pose.jpg", "STANCE")
+    save_pose_frame_image(analysis.path, impact, analysis.normalized_landmarks[impact], IMPACT_DIR / f"{prefix}_impact_pose.jpg", "IMPACT")
+
+
+def recalculate_with_manual_impacts(result, reference_impact_frame, target_impact_frame, selected_feature_names, batter_side):
+    configure_output_directory(result["output_dir"])
+    _apply_manual_impact(result["reference_analysis"], reference_impact_frame, batter_side, "reference")
+    _apply_manual_impact(result["target_analysis"], target_impact_frame, batter_side, "target")
+    return _refresh_result(result, selected_feature_names, batter_side)
