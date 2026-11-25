@@ -1,0 +1,28 @@
+"$schema" = "https://openapi.vercel.sh/vercel.json"
+
+[services.frontend]
+root = "frontend/"
+framework = "nextjs"
+
+[[services.frontend.bindings]]
+type = "service"
+service = "backend"
+format = "url"
+env = "BACKEND_URL"
+
+[services.backend]
+root = "backend/"
+framework = "fastapi"
+entrypoint = "main:app"
+
+[[rewrites]]
+source = "/api"
+destination = { service = "backend" }
+
+[[rewrites]]
+source = "/api/(.*)"
+destination = { service = "backend" }
+
+[[rewrites]]
+source = "/(.*)"
+destination = { service = "frontend" }

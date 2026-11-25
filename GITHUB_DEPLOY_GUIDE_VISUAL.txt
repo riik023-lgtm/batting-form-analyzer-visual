@@ -1,0 +1,38 @@
+Batting Form Analyzer Visual — 新規リポジトリ / Vercel手順
+
+1. GitHubで New repository
+   推奨名: batting-form-analyzer-visual
+
+2. このZIPを解凍し、中身を新規リポジトリへ全部アップロード
+
+3. Commit message
+   Initial visual 8-item analyzer
+
+4. Vercelで Add New Project → GitHub → batting-form-analyzer-visual をImport
+
+5. 既存Vercel版と同じくPrivate Blobを接続
+   - Access: Private
+   - read-write token env var を有効化
+   - BLOB_READ_WRITE_TOKEN がProject Settings > Environment Variablesにあることを確認
+
+6. Deploy
+
+7. Ready後に以下を確認
+   https://<新しいドメイン>/api/health
+
+8. "version": "visual-1.0" が出ればバックエンド成功
+
+9. アプリでテスト
+   - 2動画選択
+   - 赤枠調整
+   - インパクト指定
+   - 8項目解析
+   - 各項目に計測画像が出る
+   - 選手名を入れた場合、下部の端末内履歴に追加される
+
+10. 解析成功後、Vercel Blobに動画が残り続けないことを確認
+    アプリは成功後に自動deleteします。upload routeにも1日TTLがあります。
+
+注意:
+- 既存の batting-form-analyzer-vercel はそのまま残してください。
+- このVisual版は別repo / 別Vercel Projectで運用します。

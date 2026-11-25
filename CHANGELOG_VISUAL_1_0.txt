@@ -1,0 +1,12 @@
+Batting Form Analyzer Visual 1.0
+
+- 8項目を全件解析
+- 実動画フレームへの計測オーバーレイ
+- 計測画像生成失敗時の顔なし人体SVG fallback
+- IndexedDBによる端末内履歴
+- 複数選手の履歴管理
+- .bfaファイルをUIから廃止
+- PDF/印刷保存
+- Private Blobを解析成功後に自動削除
+- 日本語練習動画を優先表示
+- 縦横動画の2D ROI / 手動インパクト指定を継承
